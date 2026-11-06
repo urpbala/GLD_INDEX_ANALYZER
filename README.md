@@ -1,4 +1,3 @@
-# GLD_INDEX_ANALYZER
 # Index Analyzer (Nifty 50 / Bank Nifty)
 
 A web app you open from a link (works on a phone) plus a scheduled job that sends the daily report to your Telegram bot.
