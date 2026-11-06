@@ -1,0 +1,58 @@
+INDEX REPORT  2026-11-05 14:41 IST
+
+NIFTY 50  2026-11-04
+Close 23,960.6 (+0.63%)   ATR 1.24%
+🟢 BULLISH (Moderate)  score +4.0
+Trend: EMA20/50 mixed, above 200 EMA, Supertrend green
+Momentum: RSI 69 (>60), MACD bull
+India VIX 15.19  (1y percentile 69%, 5d change -6.5%) - high
+Changes: close moved above the 200 EMA
+Resistance: 26,373 (52W-H), 24,100 (24100), 24,000 (24000)
+Support: 23,900 (23900), 23,811 (PDH/23800), 23,584 (W-R2)
+Track record - building (no live calls with a 5-day outcome yet)
+Option idea (unvalidated): ATM 23950 CE; stop 45% of premium; choose the expiry yourself; size: --size <premium> --index "NIFTY 50"
+
+BANK NIFTY  2026-11-04
+Close 55,913.6 (+0.67%)   ATR 1.25%
+⚪ NEUTRAL (Weak)  score +1.0
+Trend: EMA20/50 mixed, below 200 EMA, Supertrend red
+Momentum: RSI 57 (50-60), MACD bull
+India VIX 15.19  (1y percentile 69%, 5d change -6.5%) - high
+Changes: none vs previous session
+Resistance: 56,500 (56500), 56,066 (20D-H), 55,960 (M-R1/56000)
+Support: 55,903 (W-R2), 55,739 (PDH), 55,500 (55500)
+Track record - building (no live calls with a 5-day outcome yet)
+Option idea: none (neutral)
+
+Bias rule: NOT validated yet - run index_research.py before relying on it. Research information, not advice.
+
+[telegram] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set - message not sent
+INDEX REPORT  2026-11-05 14:46 IST
+
+NIFTY 50  2026-11-04
+Close 23,960.6 (+0.63%)   ATR 1.24%
+🟢 BULLISH (Moderate)  score +4.0
+Trend: EMA20/50 mixed, above 200 EMA, Supertrend green
+Momentum: RSI 69 (>60), MACD bull
+India VIX 15.19  (1y percentile 69%, 5d change -6.5%) - high
+Changes: close moved above the 200 EMA
+Resistance: 26,373 (52W-H), 24,100 (24100), 24,000 (24000)
+Support: 23,900 (23900), 23,811 (PDH/23800), 23,584 (W-R2)
+Track record - building (no live calls with a 5-day outcome yet)
+Option idea (unvalidated): ATM 23950 CE; stop 45% of premium; choose the expiry yourself; size: --size <premium> --index "NIFTY 50"
+
+BANK NIFTY  2026-11-04
+Close 55,913.6 (+0.67%)   ATR 1.25%
+⚪ NEUTRAL (Weak)  score +1.0
+Trend: EMA20/50 mixed, below 200 EMA, Supertrend red
+Momentum: RSI 57 (50-60), MACD bull
+India VIX 15.19  (1y percentile 69%, 5d change -6.5%) - high
+Changes: none vs previous session
+Resistance: 56,500 (56500), 56,066 (20D-H), 55,960 (M-R1/56000)
+Support: 55,903 (W-R2), 55,739 (PDH), 55,500 (55500)
+Track record - building (no live calls with a 5-day outcome yet)
+Option idea: none (neutral)
+
+Bias rule: NOT validated yet - run index_research.py before relying on it. Research information, not advice.
+
+[telegram] sent
