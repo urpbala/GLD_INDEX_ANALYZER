@@ -316,24 +316,75 @@ def _select(items, close, below, n=3, tol=0.0010):
     return [(int(round(p)), "/".join(labs)) for p, labs in merged[:n]]
 
 
+def _period_frame(df: pd.DataFrame, kind: str) -> pd.DataFrame:
+    if kind == "Day":
+        return df[["high", "low", "close"]]
+    freq = "W-FRI" if kind == "Week" else "M"
+    return df.groupby(df.index.to_period(freq)).agg(high=("high", "max"), low=("low", "min"), close=("close", "last"))
+
+
+def _period_complete(df: pd.DataFrame, kind: str) -> bool:
+    """True when the period that contains the last bar is finished (next business day is in a new period).
+    Ignores exchange holidays: a Thursday last bar before a Friday holiday counts as an incomplete week."""
+    if kind == "Day":
+        return True
+    last = df.index[-1]
+    nxt = last + pd.offsets.BDay(1)
+    freq = "W-FRI" if kind == "Week" else "M"
+    return nxt.to_period(freq) != last.to_period(freq)
+
+
+def prev_ranges(df: pd.DataFrame) -> list[dict]:
+    """Previous high (PH) / previous low (PL) for day, week and month.
+
+    ph / pl      = the levels to watch in the NEXT session: the last completed period
+                   (last bar for the day; this week or month if it is already complete, else the previous one).
+    status       = where the last close sits against the range of the period BEFORE that
+                   (closed above prior high / below prior low / inside) - the classic breakout test."""
+    close = float(df["close"].iloc[-1])
+    out = []
+    for kind in ("Day", "Week", "Month"):
+        fr = _period_frame(df, kind)
+        if len(fr) < 2:
+            continue
+        complete = _period_complete(df, kind)
+        ref = fr.iloc[-1] if complete else fr.iloc[-2]
+        prior = fr.iloc[-2]
+        ph, pl = float(ref["high"]), float(ref["low"])
+        if close > float(prior["high"]):
+            status = "above"
+        elif close < float(prior["low"]):
+            status = "below"
+        else:
+            status = "inside"
+        label = {"Day": "last completed day",
+                 "Week": "this week (complete)" if complete else "previous week",
+                 "Month": "this month (complete)" if complete else "previous month"}[kind]
+        out.append(dict(period=kind, ph=ph, pl=pl, close_ref=float(ref["close"]), ref_label=label,
+                        status=status, prior_high=float(prior["high"]), prior_low=float(prior["low"]),
+                        to_ph_pct=(ph / close - 1) * 100, to_pl_pct=(pl / close - 1) * 100))
+    return out
+
+
+STATUS_TEXT = {"above": "closed above the prior high", "below": "closed below the prior low", "inside": "inside the prior range"}
+
+
 def compute_levels(df: pd.DataFrame, round_step: int = 100) -> dict:
     """Support / resistance relative to the last close. All levels are filtered by price,
     so supports are always below and resistances always above."""
     close = float(df["close"].iloc[-1])
     items = []
-    if len(df) >= 2:
-        p = df.iloc[-2]
-        items += [("PDH", float(p["high"])), ("PDL", float(p["low"]))]
-    wk = df.groupby(df.index.to_period("W-FRI")).agg(high=("high", "max"), low=("low", "min"), close=("close", "last"))
-    if len(wk) >= 2:
-        w = wk.iloc[-2]
-        pv = _pivots(w["high"], w["low"], w["close"])
-        items += [("W-PP", pv["PP"]), ("W-R1", pv["R1"]), ("W-S1", pv["S1"]), ("W-R2", pv["R2"]), ("W-S2", pv["S2"])]
-    mo = df.groupby(df.index.to_period("M")).agg(high=("high", "max"), low=("low", "min"), close=("close", "last"))
-    if len(mo) >= 2:
-        m = mo.iloc[-2]
-        pv = _pivots(m["high"], m["low"], m["close"])
-        items += [("M-PP", pv["PP"]), ("M-R1", pv["R1"]), ("M-S1", pv["S1"])]
+    pr = {r["period"]: r for r in prev_ranges(df)}
+    if "Day" in pr:
+        items += [("PDH", pr["Day"]["ph"]), ("PDL", pr["Day"]["pl"])]
+    if "Week" in pr:
+        w = pr["Week"]
+        pv = _pivots(w["ph"], w["pl"], w["close_ref"])
+        items += [("PWH", w["ph"]), ("PWL", w["pl"]), ("W-PP", pv["PP"]), ("W-R1", pv["R1"]), ("W-S1", pv["S1"])]
+    if "Month" in pr:
+        m = pr["Month"]
+        pv = _pivots(m["ph"], m["pl"], m["close_ref"])
+        items += [("PMH", m["ph"]), ("PML", m["pl"]), ("M-PP", pv["PP"]), ("M-R1", pv["R1"]), ("M-S1", pv["S1"])]
     items += [("20D-H", float(df["high"].tail(20).max())), ("20D-L", float(df["low"].tail(20).min())),
               ("52W-H", float(df["high"].tail(252).max())), ("52W-L", float(df["low"].tail(252).min()))]
     base = int(close // round_step) * round_step
