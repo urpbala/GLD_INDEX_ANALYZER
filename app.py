@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+import index_context as ictx
 import index_core as core
 import index_daily_report as dr
 import index_research as rs
@@ -25,6 +26,12 @@ LOG_FILE = "index_signal_log.csv"
 
 st.set_page_config(page_title="Index Analyzer", page_icon="📈", layout="centered",
                    initial_sidebar_state="collapsed")
+
+
+def ordinal(x: float) -> str:
+    n = int(round(x))
+    suffix = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
 
 
 def secret(name: str) -> str:
@@ -76,6 +83,25 @@ def get_research_features(name: str, years: int):
     return core.compute_features(df, vix)
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def get_gift_auto():
+    return ictx.fetch_gift_nifty()
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def get_context(prev_close, gift_price, gift_change):
+    gift = None
+    if gift_price:
+        gift = dict(price=gift_price, change_pct=gift_change, source="entered in the app")
+    return ictx.collect_context(prev_close, True, gift_override=gift)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_global_impact(years: int):
+    nifty = core.load_prices(core.INDICES["NIFTY 50"], "yfinance", "data", years)
+    return ictx.global_impact(nifty, ictx.load_global(years))
+
+
 def stale_note(infos):
     if not infos:
         return None
@@ -93,6 +119,16 @@ def levels_table(lv: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def ranges_table(ranges: list) -> pd.DataFrame:
+    rows = []
+    for r in ranges:
+        rows.append({"Period": r["period"], "PH": r["ph"], "PL": r["pl"],
+                     "To PH": f"{r['to_ph_pct']:+.1f}%", "To PL": f"{r['to_pl_pct']:+.1f}%",
+                     "Last close vs prior range": core.STATUS_TEXT[r["status"]],
+                     "Range used": r["ref_label"]})
+    return pd.DataFrame(rows)
+
+
 def show_index(info: dict, log: pd.DataFrame):
     last, name, spec = info["last"], info["name"], info["spec"]
     date = info["feats"].index[-1].date()
@@ -104,7 +140,7 @@ def show_index(info: dict, log: pd.DataFrame):
     c2.metric("Bias", str(last["bias"]), f"{last['strength']} (score {last['score']:+.1f})", delta_color="off")
     c3, c4 = st.columns(2)
     if not np.isnan(last["vix"]):
-        c3.metric("India VIX", f"{last['vix']:.2f}", f"{last['vix_pctl']:.0f}th percentile (1y)", delta_color="off")
+        c3.metric("India VIX", f"{last['vix']:.2f}", f"{ordinal(last['vix_pctl'])} percentile (1y)", delta_color="off")
     else:
         c3.metric("India VIX", "n/a")
     c4.metric("Supertrend", "Green" if last["st_state"] == "bull" else "Red")
@@ -121,6 +157,10 @@ def show_index(info: dict, log: pd.DataFrame):
 
     st.dataframe(levels_table(info["levels"]), hide_index=True, width="stretch",
                  column_config={"Level": st.column_config.NumberColumn(format="%d")})
+    st.markdown("**Previous high / low** (PH / PL, levels to watch next session)")
+    st.dataframe(ranges_table(info["ranges"]), hide_index=True, width="stretch",
+                 column_config={"PH": st.column_config.NumberColumn(format="%d"),
+                                "PL": st.column_config.NumberColumn(format="%d")})
     st.caption("Track record - " + dr.track_record(log, name))
 
     if show_option:
@@ -141,7 +181,8 @@ st.caption(f"{dt.datetime.now(core.IST):%d %b %Y, %I:%M %p} IST  ·  daily candl
 if not core.BIAS_VALIDATED:
     st.warning("The bias score is NOT validated yet. Use the Research tab to see whether it carries any information.")
 
-tab_today, tab_research, tab_size, tab_log = st.tabs(["Today", "Research", "Size", "Log"])
+infos, errors = [], []
+tab_today, tab_global, tab_research, tab_size, tab_log = st.tabs(["Today", "Global", "Research", "Size", "Log"])
 
 # ------------------------------------------------------------------- Today
 with tab_today:
@@ -165,8 +206,91 @@ with tab_today:
                 if not token or not chat:
                     st.warning("Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in the app's Secrets (see README).")
                 else:
-                    msg = dr.build_message(infos, log, errors, note, show_option)
-                    st.success("Sent to Telegram.") if dr.send_telegram(msg, token, chat) else st.error("Telegram send failed.")
+                    msg = dr.build_message(infos, log, errors, note, show_option, st.session_state.get("ctx"), "post")
+                    if dr.send_telegram(msg, token, chat):
+                        st.success("Sent to Telegram.")
+                    else:
+                        st.error("Telegram send failed.")
+
+# ------------------------------------------------------------------ Global
+with tab_global:
+    st.markdown("Clues from outside the chart: **GIFT Nifty**, **global markets** and **news**. "
+                "They hint at how the market may open. They do not decide the trend.")
+    nifty_info = next((i for i in infos if i["name"] == "NIFTY 50"), None)
+    prev_close = float(nifty_info["last"]["close"]) if nifty_info else None
+
+    st.subheader("GIFT Nifty")
+    st.caption("Read automatically from the public GIFT Nifty pages of Angel One / Upstox when possible (ordinary web pages, "
+               "not an official feed, so they can change or block). Typing a price below always overrides it.")
+    g1, g2 = st.columns(2)
+    gift_price = g1.number_input("GIFT Nifty price (0 = skip)", value=0.0, step=10.0, key="gift_price")
+    gift_chg = g2.number_input("Its change % on its own close (optional)", value=0.0, step=0.1, key="gift_chg")
+    gift = None
+    if gift_price > 0:
+        gift = dict(price=gift_price, change_pct=gift_chg if gift_chg != 0 else None, source="entered in the app")
+    else:
+        gift = get_gift_auto()
+    if gift and prev_close:
+        gap = ictx.implied_gap(gift["price"], prev_close)
+        m1, m2, m3 = st.columns(3)
+        m1.metric("GIFT Nifty", f"{gift['price']:,.0f}",
+                  f"{gift['change_pct']:+.2f}%" if gift.get("change_pct") is not None else None, delta_color="off")
+        m2.metric("Gap vs Nifty close", f"{gap['points']:+,.0f} pts", f"{gap['pct']:+.2f}%")
+        m3.metric("Read", gap["label"])
+        src = f"Source: {gift['source']}" + (f", as of {gift['asof']:%d %b %H:%M} IST" if gift.get("asof") else "")
+        if gift.get("stale"):
+            st.warning(src + " - older than 18 hours (market closed, or the page is not updating).")
+        else:
+            st.caption(src)
+        st.caption("GIFT is a futures price, so a small premium is normal. Its change on its own close is the cleaner signal.")
+    elif not names or "NIFTY 50" not in names:
+        st.info("Select NIFTY 50 in the sidebar to compare GIFT with the Nifty close.")
+    else:
+        st.info("GIFT Nifty not entered.")
+
+    st.subheader("Global cues and news")
+    if st.button("Load global cues and news", width="stretch"):
+        with st.spinner("Loading global markets and headlines..."):
+            st.session_state["ctx"] = get_context(prev_close, gift["price"] if gift else None,
+                                                  gift.get("change_pct") if gift else None)
+    ctx = st.session_state.get("ctx")
+    if ctx:
+        gd = ctx.get("global_df")
+        if gd is not None and len(gd):
+            st.metric("Global cue score", f"{ctx['composite']:+.2f}", ctx["global_label"], delta_color="off")
+            show = gd[["region", "name", "date", "last", "chg_pct", "chg5_pct"]].copy()
+            show.columns = ["Region", "Market", "Last session", "Level", "1-day %", "5-day %"]
+            st.dataframe(show.round(2), hide_index=True, width="stretch")
+            st.caption("A rise in the dollar index, US yields, Brent, USD/INR or US VIX counts against Indian stocks. "
+                       "Each move is scaled by that market's own recent volatility.")
+        news = ctx.get("news")
+        if news and news["n"]:
+            themes = f" Themes: {', '.join(news['themes'])}." if news["themes"] else ""
+            st.markdown(f"**News tone:** {news['label']} ({news['neg']} negative / {news['pos']} positive of {news['n']} headlines).{themes}")
+            for note in news["notes"]:
+                st.markdown("- " + note.replace("$", "\\$"))
+            st.caption("Keyword tone is crude: read the headlines, do not trade the label.")
+        elif news is not None:
+            st.caption("No recent headlines found.")
+        for e in ctx.get("errors", []):
+            st.warning(e)
+
+    with st.expander("How much have global markets mattered for Nifty? (research)"):
+        st.caption("US markets close after India, so the NEXT-day correlation is the relevant one. Asia and Europe overlap "
+                   "Indian hours, so look at the same-day column. Correlation is not a trading rule.")
+        if st.button("Run global impact research", width="stretch"):
+            with st.spinner("Loading 15 years of global data - the first run takes a while..."):
+                try:
+                    st.session_state["gimpact"] = get_global_impact(15)
+                except Exception as e:
+                    st.error(f"Research failed: {e}")
+        gi = st.session_state.get("gimpact")
+        if gi is not None and len(gi):
+            gi = gi.rename(columns={"name": "Market", "region": "Region", "days": "Days", "corr_same_day": "Corr same day",
+                                    "corr_next_day": "Corr next day", "n_down": "# drops >=1%",
+                                    "nifty_after_down_pct": "Nifty next day after a drop %", "n_up": "# rises >=1%",
+                                    "nifty_after_up_pct": "Nifty next day after a rise %"})
+            st.dataframe(gi.round(2), hide_index=True, width="stretch")
 
 # ---------------------------------------------------------------- Research
 with tab_research:
