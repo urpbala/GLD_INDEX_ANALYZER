@@ -1,0 +1,58 @@
+name: Pre-market brief (morning)
+
+on:
+  schedule:
+    # 03:00 UTC = 08:30 IST, Monday to Friday. GitHub cron can run late (sometimes hours).
+    - cron: "0 3 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      gift_price:
+        description: "GIFT Nifty price from your broker app (optional, e.g. 24610)"
+        required: false
+        default: ""
+      gift_change:
+        description: "GIFT Nifty change % on its own close (optional, e.g. 0.35)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: index-report
+  cancel-in-progress: false
+
+jobs:
+  brief:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install packages
+        run: pip install -r requirements.txt
+
+      - name: Run pre-market brief and send to Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GIFT_IN: ${{ inputs.gift_price }}
+          GIFT_CHG_IN: ${{ inputs.gift_change }}
+        run: |
+          ARGS="--mode pre"
+          if [[ "$GIFT_IN" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then ARGS="$ARGS --gift-price $GIFT_IN"; fi
+          if [[ "$GIFT_CHG_IN" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then ARGS="$ARGS --gift-change $GIFT_CHG_IN"; fi
+          python index_daily_report.py $ARGS
+
+      - name: Save the context log
+        run: |
+          git config user.name "index-report-bot"
+          git config user.email "index-report-bot@users.noreply.github.com"
+          git add index_context_log.csv
+          git diff --cached --quiet || git commit -m "Update context log"
+          git pull --rebase
+          git push
