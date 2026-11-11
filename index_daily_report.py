@@ -35,6 +35,7 @@ import time
 import numpy as np
 import pandas as pd
 
+import index_context as ictx
 import index_core as core
 
 LOG_COLS = ["date", "index", "close", "bias", "strength", "score", "st", "rsi", "vix", "vix_pctl",
@@ -172,7 +173,8 @@ def analyse_index(name: str, spec: dict, args, vix_df) -> dict:
     if last["vix_state"] != prev["vix_state"] and last["vix_state"] != "n/a":
         changes.append(f"VIX regime {prev['vix_state']} -> {last['vix_state']}")
 
-    return dict(name=name, spec=spec, df=df, feats=feats, last=last, levels=lv, changes=changes)
+    return dict(name=name, spec=spec, df=df, feats=feats, last=last, levels=lv, changes=changes,
+                ranges=core.prev_ranges(df))
 
 
 def build_block(info: dict, track: str, show_option: bool) -> str:
@@ -200,7 +202,11 @@ def build_block(info: dict, track: str, show_option: bool) -> str:
     lv = info["levels"]
     res = ", ".join(f"{p:,} ({esc(l)})" for p, l in reversed(lv["resistances"])) or "-"
     sup = ", ".join(f"{p:,} ({esc(l)})" for p, l in lv["supports"]) or "-"
-    lines += [f"Resistance: {res}", f"Support: {sup}", f"Track record - {esc(track)}"]
+    lines += [f"Resistance: {res}", f"Support: {sup}", "Previous high / low (day, week, month):"]
+    for r in info["ranges"]:
+        lines.append(f"• {r['period']}: PH {r['ph']:,.0f} ({r['to_ph_pct']:+.1f}%) / PL {r['pl']:,.0f} "
+                     f"({r['to_pl_pct']:+.1f}%) - {esc(core.STATUS_TEXT[r['status']])}")
+    lines.append(f"Track record - {esc(track)}")
     if show_option:
         atm = core.atm_strike(close, spec["strike_step"])
         if bias == "BULLISH":
@@ -217,14 +223,17 @@ def build_block(info: dict, track: str, show_option: bool) -> str:
     return "\n".join(lines)
 
 
-def build_message(infos: list[dict], log: pd.DataFrame, errors: list[str], stale: str | None, show_option: bool) -> str:
+def build_message(infos: list[dict], log: pd.DataFrame, errors: list[str], stale: str | None, show_option: bool,
+                  ctx: dict | None = None, mode: str = "post") -> str:
     now = dt.datetime.now(core.IST)
-    head = f"<b>INDEX REPORT</b>  {now:%Y-%m-%d %H:%M} IST"
-    parts = [head]
+    title = "PRE-MARKET BRIEF" if mode == "pre" else "INDEX REPORT"
+    parts = [f"<b>{title}</b>  {now:%Y-%m-%d %H:%M} IST"]
     if stale:
         parts.append(f"⚠️ {esc(stale)}")
     for info in infos:
         parts.append(build_block(info, track_record(log, info["name"]), show_option))
+    if ctx:
+        parts.append(ictx.context_html(ctx))
     for e in errors:
         parts.append(f"⚠️ {esc(e)}")
     foot = ("Bias rule: " + ("validated by research" if core.BIAS_VALIDATED else
@@ -234,22 +243,40 @@ def build_message(infos: list[dict], log: pd.DataFrame, errors: list[str], stale
     return "\n\n".join(parts)
 
 
+def next_session_date(asof: str | None = None) -> dt.date:
+    """The Indian session the pre-market brief is about (today before the close, else the next weekday)."""
+    now = dt.datetime.now(core.IST)
+    d = pd.Timestamp(asof).date() if asof else now.date()
+    if asof or (now.hour, now.minute) >= (15, 30) or now.weekday() >= 5:
+        d += dt.timedelta(days=1)
+    while d.weekday() >= 5:
+        d += dt.timedelta(days=1)
+    return d
+
+
 # ---------------------------------------------------------------------- main
 def main():
     core.ensure_utf8()
     core.load_env_file(".env")
     ap = argparse.ArgumentParser(description="Daily index report -> Telegram")
+    ap.add_argument("--mode", choices=["post", "pre"], default="post",
+                    help="post = after the close (logs the call); pre = morning brief with GIFT / global cues")
     ap.add_argument("--source", choices=["yfinance", "csv", "angel"], default="yfinance")
     ap.add_argument("--csv-dir", default="data")
     ap.add_argument("--years", type=int, default=6, help="history to load (6 is enough for the daily report)")
     ap.add_argument("--indices", default=",".join(core.INDICES))
     ap.add_argument("--dry-run", action="store_true", help="print only, send nothing")
-    ap.add_argument("--no-log", action="store_true", help="do not write the signal log")
+    ap.add_argument("--no-log", action="store_true", help="do not write the logs")
     ap.add_argument("--include-partial", action="store_true", help="keep today's candle even if the market is open")
     ap.add_argument("--asof", default=None, help="YYYY-MM-DD, run as if that were the last session (testing)")
     ap.add_argument("--log-file", default="index_signal_log.csv")
+    ap.add_argument("--ctx-log-file", default="index_context_log.csv")
     ap.add_argument("--out-dir", default="index_reports")
     ap.add_argument("--no-option-idea", action="store_true")
+    ap.add_argument("--no-context", action="store_true", help="skip GIFT / global cues / news")
+    ap.add_argument("--no-news", action="store_true")
+    ap.add_argument("--gift-price", type=float, default=None, help="GIFT Nifty price you read from your broker app")
+    ap.add_argument("--gift-change", type=float, default=None, help="GIFT Nifty change %% on its own close (optional)")
     ap.add_argument("--test-telegram", action="store_true")
     ap.add_argument("--size", type=float, default=None, help="option premium: print position size and exit")
     ap.add_argument("--index", default="NIFTY 50", help="index name for --size")
@@ -272,6 +299,8 @@ def main():
         ok = send_telegram("Index report bot: test message OK.", token, chat) if token and chat else False
         print("sent" if ok else "NOT sent (check TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)")
         return
+
+    pre = args.mode == "pre"
 
     # --- load data
     try:
@@ -301,9 +330,20 @@ def main():
             stale = (f"latest candle is {last_date}, expected {expected} - market holiday, "
                      "or the data source has not updated yet")
 
-    # --- log + outcomes
+    # --- GIFT / global / news context
+    ctx = None
+    nifty_info = next((i for i in infos if i["name"] == "NIFTY 50"), None)
+    if not args.no_context:
+        gift = None
+        if args.gift_price:
+            gift = dict(price=args.gift_price, change_pct=args.gift_change, source="entered via --gift-price")
+        prev_close = float(nifty_info["last"]["close"]) if nifty_info else None
+        ctx = ictx.collect_context(prev_close, want_news=not args.no_news, gift_override=gift)
+
+    # --- signal log (post mode) and outcomes
     log = read_log(args.log_file)
-    if not args.no_log:
+    can_write = (not args.no_log) and (not args.dry_run or bool(args.asof))
+    if not pre and not args.no_log:
         for info in infos:
             last = info["last"]
             log = upsert_log(log, dict(
@@ -315,16 +355,32 @@ def main():
                 source="asof-test" if args.asof else "live", ret_1d=np.nan, ret_3d=np.nan, ret_5d=np.nan))
     for info in infos:
         log = fill_outcomes(log, info["name"], info["df"])
-    if not args.no_log and not args.dry_run:
+    if can_write and not pre:
         log.to_csv(args.log_file, index=False)
-    elif not args.no_log and args.dry_run and args.asof:
-        log.to_csv(args.log_file, index=False)   # allows testing the outcome fill
 
-    msg = build_message(infos, log, errors, stale, not args.no_option_idea)
+    # --- context log (pre mode): GIFT gap / global score now, real open and day move filled in later
+    if ctx is not None and nifty_info is not None:
+        clog = ictx.read_ctx_log(args.ctx_log_file)
+        if pre and not args.no_log:
+            g, gap, news = ctx.get("gift"), ctx.get("gap"), ctx.get("news")
+            clog = ictx.upsert_ctx_log(clog, dict(
+                date=str(next_session_date(args.asof)), gift_price=g["price"] if g else np.nan,
+                gift_change_pct=g.get("change_pct") if g else np.nan,
+                nifty_prev_close=round(float(nifty_info["last"]["close"]), 2),
+                implied_gap_pct=round(gap["pct"], 3) if gap else np.nan,
+                global_score=round(ctx["composite"], 3) if ctx.get("composite") is not None else np.nan,
+                global_label=ctx.get("global_label") or "", news_score=round(news["score"], 3) if news else np.nan,
+                source="asof-test" if args.asof else "live", actual_gap_pct=np.nan, nifty_day_ret_pct=np.nan))
+        clog = ictx.fill_ctx_outcomes(clog, nifty_info["df"])
+        ctx["track"] = ictx.ctx_track_record(clog)
+        if can_write and pre:
+            clog.to_csv(args.ctx_log_file, index=False)
+
+    msg = build_message(infos, log, errors, stale, not args.no_option_idea, ctx, args.mode)
     print(strip_tags(msg))
     os.makedirs(args.out_dir, exist_ok=True)
     stamp = dt.datetime.now(core.IST).strftime("%Y%m%d")
-    with open(os.path.join(args.out_dir, f"index_report_{stamp}.txt"), "w", encoding="utf-8") as f:
+    with open(os.path.join(args.out_dir, f"index_report_{stamp}_{args.mode}.txt"), "w", encoding="utf-8") as f:
         f.write(strip_tags(msg))
 
     if args.dry_run:
