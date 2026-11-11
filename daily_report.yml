@@ -1,13 +1,13 @@
-name: Daily index report
+name: Daily index report (after close)
 
 on:
   schedule:
     # 10:20 UTC = 15:50 IST, Monday to Friday. GitHub cron can run late (sometimes hours).
     - cron: "20 10 * * 1-5"
-  workflow_dispatch:        # lets you run it by hand (Actions tab -> Run workflow), also from a phone
+  workflow_dispatch:        # run by hand: Actions tab -> Run workflow (works from a phone)
 
 permissions:
-  contents: write           # needed to save the signal log back to the repo
+  contents: write           # needed to save the logs back to the repo
 
 concurrency:
   group: index-report
@@ -31,12 +31,13 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python index_daily_report.py
+        run: python index_daily_report.py --mode post
 
-      - name: Save the signal log
+      - name: Save the logs
         run: |
           git config user.name "index-report-bot"
           git config user.email "index-report-bot@users.noreply.github.com"
           git add index_signal_log.csv
           git diff --cached --quiet || git commit -m "Update signal log"
+          git pull --rebase
           git push
