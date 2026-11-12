@@ -121,7 +121,7 @@ def build_plan(info: dict, ctx: dict | None = None, capital: float = core.CAPITA
         lvl, lab = pull[0]
         pstop = lvl - side * PULLBACK_STOP_ATR * atr
         plan.update(pull_level=lvl, pull_label=lab, pull_stop=pstop, pull_pts=abs(lvl - pstop))
-    if gift_price is not None and (gift_price - trigger) * side > 0:
+    if gift_price and gift_price > 0 and (gift_price - trigger) * side > 0:
         notes.append(f"GIFT ({gift_price:,.0f}) is already beyond the trigger: do not chase the open, wait for a pullback or skip")
 
     # ---- does it fit the risk limit?
