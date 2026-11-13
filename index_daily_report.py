@@ -37,6 +37,7 @@ import pandas as pd
 
 import index_context as ictx
 import index_core as core
+import index_plan as iplan
 
 LOG_COLS = ["date", "index", "close", "bias", "strength", "score", "st", "rsi", "vix", "vix_pctl",
             "source", "ret_1d", "ret_3d", "ret_5d"]
@@ -224,7 +225,7 @@ def build_block(info: dict, track: str, show_option: bool) -> str:
 
 
 def build_message(infos: list[dict], log: pd.DataFrame, errors: list[str], stale: str | None, show_option: bool,
-                  ctx: dict | None = None, mode: str = "post") -> str:
+                  ctx: dict | None = None, mode: str = "post", plan: bool = True) -> str:
     now = dt.datetime.now(core.IST)
     title = "PRE-MARKET BRIEF" if mode == "pre" else "INDEX REPORT"
     parts = [f"<b>{title}</b>  {now:%Y-%m-%d %H:%M} IST"]
@@ -232,6 +233,8 @@ def build_message(infos: list[dict], log: pd.DataFrame, errors: list[str], stale
         parts.append(f"⚠️ {esc(stale)}")
     for info in infos:
         parts.append(build_block(info, track_record(log, info["name"]), show_option))
+        if plan:
+            parts.append(iplan.plan_html(iplan.build_plan(info, ctx)))
     if ctx:
         parts.append(ictx.context_html(ctx))
     for e in errors:
@@ -273,6 +276,7 @@ def main():
     ap.add_argument("--ctx-log-file", default="index_context_log.csv")
     ap.add_argument("--out-dir", default="index_reports")
     ap.add_argument("--no-option-idea", action="store_true")
+    ap.add_argument("--no-plan", action="store_true", help="leave the trade-plan block out of the message")
     ap.add_argument("--no-context", action="store_true", help="skip GIFT / global cues / news")
     ap.add_argument("--no-news", action="store_true")
     ap.add_argument("--gift-price", type=float, default=None, help="GIFT Nifty price you read from your broker app")
@@ -376,7 +380,7 @@ def main():
         if can_write and pre:
             clog.to_csv(args.ctx_log_file, index=False)
 
-    msg = build_message(infos, log, errors, stale, not args.no_option_idea, ctx, args.mode)
+    msg = build_message(infos, log, errors, stale, not args.no_option_idea, ctx, args.mode, not args.no_plan)
     print(strip_tags(msg))
     os.makedirs(args.out_dir, exist_ok=True)
     stamp = dt.datetime.now(core.IST).strftime("%Y%m%d")
