@@ -17,15 +17,57 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-import index_context as ictx
-import index_core as core
-import index_daily_report as dr
-import index_research as rs
+import importlib
+import inspect
 
 LOG_FILE = "index_signal_log.csv"
 
+# Files that must all come from the same download. If one is old or missing, say so clearly instead of crashing.
+REQUIRED = {
+    "index_core": ["compute_features", "compute_levels", "prev_ranges", "STATUS_TEXT", "size_calc"],
+    "index_research": ["compute_tables", "prepare", "render_text", "CAUTION"],
+    "index_context": ["collect_context", "fetch_gift_nifty", "global_impact", "load_global", "implied_gap",
+                      "gift_from_zerodha", "parse_zerodha"],
+    "index_plan": ["build_plan", "plan_html", "LIMITS"],
+    "index_daily_report": ["analyse_index", "build_message", "track_record", "read_log", "send_telegram"],
+}
+
+
+def check_files() -> list:
+    problems = []
+    for mod, attrs in REQUIRED.items():
+        try:
+            m = importlib.import_module(mod)
+        except Exception as e:
+            problems.append(f"{mod}.py is missing from the repo or has an error ({type(e).__name__}: {e})")
+            continue
+        missing = [a for a in attrs if not hasattr(m, a)]
+        if missing:
+            problems.append(f"{mod}.py is an OLD version (it lacks: {', '.join(missing)})")
+        elif mod == "index_daily_report" and "plan" not in inspect.signature(m.build_message).parameters:
+            problems.append("index_daily_report.py is an OLD version (build_message has no plan option)")
+        elif mod == "index_context" and "diag" not in inspect.signature(m.fetch_gift_nifty).parameters:
+            problems.append("index_context.py is an OLD version (fetch_gift_nifty has no diagnostics)")
+    return problems
+
+
 st.set_page_config(page_title="Index Analyzer", page_icon="📈", layout="centered",
                    initial_sidebar_state="collapsed")
+
+_problems = check_files()
+if _problems:
+    st.error("Some files in your GitHub repository are missing or out of date.")
+    for _p in _problems:
+        st.markdown("- " + _p)
+    st.markdown("**Fix:** upload ALL the files from `index-analyzer.zip` to the repository (replace the existing ones), "
+                "then in Streamlit Cloud open the app menu and choose **Reboot app**.")
+    st.stop()
+
+import index_context as ictx  # noqa: E402
+import index_core as core  # noqa: E402
+import index_daily_report as dr  # noqa: E402
+import index_plan as iplan  # noqa: E402
+import index_research as rs  # noqa: E402
 
 
 def ordinal(x: float) -> str:
@@ -85,7 +127,9 @@ def get_research_features(name: str, years: int):
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_gift_auto():
-    return ictx.fetch_gift_nifty()
+    diag = []
+    gift = ictx.fetch_gift_nifty(diag)
+    return gift, diag
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -129,6 +173,51 @@ def ranges_table(ranges: list) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def show_plan(info: dict):
+    plan = iplan.build_plan(info, st.session_state.get("ctx"), capital, risk_pct)
+    with st.expander(f"Trade plan - {info['name']}", expanded=True):
+        if plan["side"] == 0:
+            st.info(f"No trade: {plan.get('reason', 'no directional bias')}.")
+            return
+        side_txt = "LONG" if plan["side"] == 1 else "SHORT"
+        verdict = plan["verdict"]
+        if verdict == "ALIGNED":
+            st.success(f"**{verdict}** - {side_txt} idea")
+        elif verdict in ("TREND ONLY", "WAIT (big gap)"):
+            st.info(f"**{verdict}** - {side_txt} idea")
+        else:
+            st.warning(f"**{verdict}** - {side_txt} idea")
+        if plan["confirms"]:
+            st.markdown("**For:** " + "; ".join(plan["confirms"]))
+        if plan["conflicts"]:
+            st.markdown("**Against:** " + "; ".join(plan["conflicts"]))
+        above = "above" if plan["side"] == 1 else "below"
+        st.markdown(f"**Breakout entry:** 15-min close {above} **{plan['trigger']:,.0f}** ({plan['trigger_label']}). "
+                    f"Stop **{plan['stop']:,.0f}** ({plan['stop_pts']:,.0f} pts, {plan['stop_pct']:.1f}%).")
+        if plan.get("pull_level") is not None:
+            st.markdown(f"**Pullback entry:** hold {above} **{plan['pull_level']:,.0f}** ({plan['pull_label']}). "
+                        f"Stop **{plan['pull_stop']:,.0f}** ({plan['pull_pts']:,.0f} pts).")
+        st.markdown("**Targets:** " + ", ".join(f"{p:,.0f} ({l}, {r:.1f}R)" for p, l, r in plan["targets"])
+                    + ". Book part at 1R, trail the rest.")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Your risk limit", f"₹{plan['max_risk']:,.0f}")
+        c2.metric("Fits 1 lot (ATM option)?", "Yes" if plan["fits_option"] else "No",
+                  f"up to ~{plan['budget_opt_pts']:,.0f} pts", delta_color="off")
+        c3.metric("Plan stop", f"{plan['stop_pts']:,.0f} pts")
+        if not plan["fits_option"]:
+            st.warning("The stop is wider than your risk limit allows for one lot. Skip it, use a tighter 15-min structure stop, "
+                       "or a defined-risk spread.")
+        prem = st.number_input("Option premium to size (optional)", min_value=0.0, value=0.0, step=1.0,
+                               key=f"plan_prem_{info['name']}")
+        if prem > 0:
+            r = core.size_calc(prem, int(plan["lot"]), capital, risk_pct, sl_pct)
+            st.markdown(f"At premium {prem:,.1f}: risk per lot ₹{r['risk_per_lot']:,.0f} at your {int(sl_pct * 100)}% premium stop "
+                        f"-> **{r['lots']} lot(s)**.")
+        for n in plan["notes"]:
+            st.caption("Note: " + n)
+        st.caption(iplan.LIMITS)
+
+
 def show_index(info: dict, log: pd.DataFrame):
     last, name, spec = info["last"], info["name"], info["spec"]
     date = info["feats"].index[-1].date()
@@ -162,6 +251,8 @@ def show_index(info: dict, log: pd.DataFrame):
                  column_config={"PH": st.column_config.NumberColumn(format="%d"),
                                 "PL": st.column_config.NumberColumn(format="%d")})
     st.caption("Track record - " + dr.track_record(log, name))
+
+    show_plan(info)
 
     if show_option:
         atm = core.atm_strike(close, spec["strike_step"])
@@ -220,16 +311,19 @@ with tab_global:
     prev_close = float(nifty_info["last"]["close"]) if nifty_info else None
 
     st.subheader("GIFT Nifty")
-    st.caption("Read automatically from the public GIFT Nifty pages of Angel One / Upstox when possible (ordinary web pages, "
-               "not an official feed, so they can change or block). Typing a price below always overrides it.")
+    st.caption("Read automatically from the public GIFT Nifty pages of Angel One and Upstox, then Zerodha (read with a headless browser) "
+               "if those fail. These are ordinary web pages, not an official feed, so they can change or block. "
+               "Typing a price below always overrides them.")
     g1, g2 = st.columns(2)
-    gift_price = g1.number_input("GIFT Nifty price (0 = skip)", value=0.0, step=10.0, key="gift_price")
+    gift_price = g1.number_input("Type a GIFT price to override the auto-read value (0 = use auto)", value=0.0, step=10.0,
+                                 key="gift_price")
     gift_chg = g2.number_input("Its change % on its own close (optional)", value=0.0, step=0.1, key="gift_chg")
-    gift = None
+    gift, gift_diag = None, []
     if gift_price > 0:
         gift = dict(price=gift_price, change_pct=gift_chg if gift_chg != 0 else None, source="entered in the app")
     else:
-        gift = get_gift_auto()
+        with st.spinner("Reading GIFT Nifty (a browser may start, this can take up to a minute)..."):
+            gift, gift_diag = get_gift_auto()
     if gift and prev_close:
         gap = ictx.implied_gap(gift["price"], prev_close)
         m1, m2, m3 = st.columns(3)
@@ -246,7 +340,11 @@ with tab_global:
     elif not names or "NIFTY 50" not in names:
         st.info("Select NIFTY 50 in the sidebar to compare GIFT with the Nifty close.")
     else:
-        st.info("GIFT Nifty not entered.")
+        st.warning("GIFT Nifty could not be read automatically and no price was typed. See the details below.")
+    if gift_diag:
+        with st.expander("GIFT reading details (why a source failed)"):
+            for line in gift_diag:
+                st.caption(line)
 
     st.subheader("Global cues and news")
     if st.button("Load global cues and news", width="stretch"):
