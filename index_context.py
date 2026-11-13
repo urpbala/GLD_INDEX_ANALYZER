@@ -19,6 +19,8 @@ import datetime as dt
 import html
 import os
 import re
+import shutil
+import time
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote_plus
@@ -198,7 +200,13 @@ GIFT_PAGES = [
 ]
 
 
-def gift_from_web(fetcher=None, now=None):
+def _note(diag, msg: str):
+    print(f"[context] {msg}")
+    if diag is not None:
+        diag.append(msg)
+
+
+def gift_from_web(fetcher=None, now=None, diag=None):
     """Read GIFT Nifty from the public quote pages of two brokers and keep the freshest reading.
     These are ordinary web pages, not an official API: they can change, block cloud servers or have
     terms that restrict automated use. It is called at most a couple of times a day. Switch off with GIFT_WEB=0."""
@@ -220,9 +228,9 @@ def gift_from_web(fetcher=None, now=None):
             if res:
                 found.append(res)
             else:
-                print(f"[context] {name}: price not found on the page (layout changed or blocked?)")
+                _note(diag, f"{name}: price not found on the page (layout changed, or the server was blocked)")
         except Exception as e:
-            print(f"[context] {name} GIFT page failed: {e}")
+            _note(diag, f"{name}: {type(e).__name__}: {str(e)[:120]}")
     if not found:
         return None
     best = max(found, key=lambda r: r["asof"])
@@ -230,7 +238,134 @@ def gift_from_web(fetcher=None, now=None):
     return best
 
 
-def fetch_gift_nifty():
+# ---------------------------------------------------- Zerodha page (needs a real browser)
+ZERODHA_URL = "https://zerodha.com/market/giftnifty/"
+_ZERODHA_WAIT = r"Prev\.?\s*close\s*[:\-]?\s*[\d,]{4,}"
+
+
+def selenium_page_text(url: str, wait_regex: str | None = None, timeout: int = 30) -> str:
+    """Open the page in headless Chrome, wait until the JavaScript has filled in the numbers, return the visible text.
+    Needs `pip install selenium` and Chrome / Chromium (preinstalled on GitHub Actions; on Streamlit Cloud see packages.txt)."""
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.common.by import By
+
+    opts = Options()
+    for a in ("--headless=new", "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--window-size=1280,2200",
+              "--lang=en-IN", "--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/124.0 Safari/537.36"):
+        opts.add_argument(a)
+    binary = os.environ.get("CHROME_BIN") or next(
+        (shutil.which(b) for b in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable") if shutil.which(b)), None)
+    if binary:
+        opts.binary_location = binary
+    drv = shutil.which("chromedriver")
+    driver = webdriver.Chrome(service=Service(drv) if drv else Service(), options=opts)   # Service() lets Selenium find a driver
+    try:
+        driver.set_page_load_timeout(timeout)
+        driver.get(url)
+        text, end = "", time.time() + timeout
+        while time.time() < end:
+            text = driver.find_element(By.TAG_NAME, "body").text
+            if wait_regex is None or re.search(wait_regex, text, re.I):
+                break
+            time.sleep(1)
+        return text
+    finally:
+        driver.quit()
+
+
+_WHEN_FORMATS = ["%d %b %Y, %I:%M %p", "%d %b %Y %I:%M %p", "%d %b, %Y | %I:%M %p", "%d %b %Y, %H:%M", "%d %b %Y %H:%M",
+                 "%d %b, %Y %H:%M", "%d-%b-%Y %H:%M:%S", "%d %B %Y, %I:%M %p", "%d %B %Y %H:%M", "%Y-%m-%d %H:%M:%S",
+                 "%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d %b %Y, %I:%M:%S %p", "%d %b %Y %H:%M:%S"]
+
+
+def _parse_when(text: str):
+    t = re.sub(r"\b(IST|GMT\+5:30)\b", "", text or "", flags=re.I).replace("|", " ").replace(",", " , ")
+    t = re.sub(r"\s+", " ", t).replace(" , ", ", ").strip(" .")
+    for cand in {t, t.replace(",", ""), t.replace(",", "").replace("Sept", "Sep")}:
+        for fmt in _WHEN_FORMATS:
+            for f in {fmt, fmt.replace(",", "")}:
+                try:
+                    return dt.datetime.strptime(cand, f).replace(tzinfo=core.IST)
+                except ValueError:
+                    continue
+    return None
+
+
+def parse_zerodha(text: str, now=None):
+    """Parse the rendered text of zerodha.com/market/giftnifty/ (labels: Open, High, Prev. close, Low, Last updated)."""
+    now = now or dt.datetime.now(core.IST)
+    t = re.sub(r"[ \t]+", " ", text or "")
+
+    def grab(label):
+        m = re.search(label + r"\s*[:\-]?\s*([\d,]+(?:\.\d+)?)", t, re.I)
+        return (_f(m.group(1)), m.start()) if m else (None, None)
+
+    op, op_pos = grab(r"\bOpen\b")
+    hi, _ = grab(r"\bHigh\b")
+    lo, _ = grab(r"\bLow\b")
+    pc, _ = grab(r"Prev\.?\s*close")
+    price = None
+    m = re.search(r"(?:LTP|Last price|Last traded price)\s*[:\-]?\s*([\d,]+(?:\.\d+)?)", t, re.I)
+    if m:
+        price = _f(m.group(1))
+    if price is None:
+        m = re.search(r"GIFT\s*NIFTY\s*([\d,]+(?:\.\d+)?)", t, re.I)
+        if m:
+            price = _f(m.group(1))
+    if price is None and pc:
+        head = t[:op_pos] if op_pos else t
+        nums = [_f(x) for x in re.findall(r"[\d,]{5,}(?:\.\d+)?", head)]
+        plausible = [x for x in nums if abs(x / pc - 1) < 0.08]
+        if plausible:
+            price = plausible[0]
+    if not (price and pc):
+        return None
+    if hi and lo and not (lo * 0.99 <= price <= hi * 1.01):
+        return None                                   # number is outside the day's range: probably not the price
+    asof = None
+    lines = [ln.strip() for ln in (text or "").splitlines()]
+    for i, ln in enumerate(lines):
+        if ln.lower().startswith("last updated"):
+            rest = ln.split(":", 1)[1].strip() if ":" in ln else ""
+            if not rest:
+                rest = next((x for x in lines[i + 1:i + 3] if x), "")
+            asof = _parse_when(rest)
+            break
+    return dict(price=price, change_pct=(price / pc - 1) * 100, prev_close=pc, open=op, high=hi, low=lo,
+                source="Zerodha page (browser)", asof=asof,
+                stale=((now - asof) > dt.timedelta(hours=18)) if asof else None)
+
+
+def gift_from_zerodha(renderer=None, now=None, diag=None):
+    """GIFT Nifty from Zerodha's public page via a headless browser. Switch off with GIFT_ZERODHA=0."""
+    if os.environ.get("GIFT_ZERODHA", "1") == "0":
+        return None
+    now = now or dt.datetime.now(core.IST)
+    renderer = renderer or (lambda url: selenium_page_text(url, _ZERODHA_WAIT))
+    try:
+        text = renderer(ZERODHA_URL)
+    except ModuleNotFoundError:
+        _note(diag, "Zerodha: selenium is not installed (add `selenium` to requirements.txt)")
+        return None
+    except Exception as e:
+        if "obtain driver" in str(e) or type(e).__name__ == "NoSuchDriverException":
+            _note(diag, "Zerodha: Chrome / chromedriver not found on this server (Streamlit Cloud needs packages.txt with "
+                        "chromium and chromium-driver; GitHub Actions has Chrome built in)")
+        else:
+            _note(diag, f"Zerodha browser read failed: {type(e).__name__}: {str(e).splitlines()[0][:140] if str(e) else ''}")
+        return None
+    res = parse_zerodha(text, now)
+    if not res:
+        _note(diag, "Zerodha: page opened but no price could be read (layout changed, or numbers not loaded). "
+                    "Run `python index_context.py --dump-zerodha` and send me the output")
+        return None
+    return res
+
+
+def fetch_gift_nifty(diag=None):
     price = _num(os.environ.get("GIFT_NIFTY_PRICE", ""))
     if price:
         return dict(price=price, change_pct=_num(os.environ.get("GIFT_NIFTY_CHANGE_PCT", "")), source="entered manually")
@@ -241,14 +376,27 @@ def fetch_gift_nifty():
             c = df["close"].astype(float)
             return dict(price=float(c.iloc[-1]), change_pct=float((c.iloc[-1] / c.iloc[-2] - 1) * 100), source=f"Yahoo {tk}")
         except Exception as e:
-            print(f"[context] GIFT ticker {tk} failed: {e}")
+            _note(diag, f"GIFT ticker {tk} failed: {e}")
     try:
         custom = load_gift_custom()
         if custom:
             return custom
     except Exception as e:
-        print(f"[context] load_gift_custom failed: {e}")
-    return gift_from_web()
+        _note(diag, f"load_gift_custom failed: {e}")
+    web = gift_from_web(diag=diag)
+    if web and not web.get("stale"):
+        return web
+    if web:
+        _note(diag, f"{web['source']} reading is older than 18 hours")
+    zd = gift_from_zerodha(diag=diag)          # slower (starts a browser), so only when the static pages gave nothing fresh
+    cands = [x for x in (web, zd) if x]
+    if not cands:
+        return None
+    fresh = [x for x in cands if x.get("stale") is False]
+    if fresh:
+        return max(fresh, key=lambda r: r["asof"])
+    known = [x for x in cands if x.get("asof")]
+    return max(known, key=lambda r: r["asof"]) if known else cands[0]
 
 
 def implied_gap(gift_price: float, prev_close: float) -> dict:
@@ -357,7 +505,9 @@ def collect_context(prev_close: float | None = None, want_news: bool = True, gif
             ctx["errors"].append("global indices unavailable")
     except Exception as e:
         ctx["errors"].append(f"global indices: {e}")
-    gift = gift_override or fetch_gift_nifty()
+    diag: list = []
+    gift = gift_override or fetch_gift_nifty(diag)
+    ctx["gift_diag"] = diag
     if gift and prev_close:
         gap = implied_gap(gift["price"], prev_close)
         if abs(gap["pct"]) > 8:
@@ -385,7 +535,9 @@ def context_html(ctx: dict | None) -> str:
         lines.append(f"GIFT Nifty <code>{g['price']:,.0f}</code>: {gap['pct']:+.2f}% ({gap['points']:+,.0f} pts) vs Nifty close - "
                      f"{e(gap['label'])}{chg} [{e(g['source'])}{when}]{old}. Includes futures basis, so a small premium is normal.")
     else:
-        lines.append("GIFT Nifty: not available (enter it in the app, or see README) - check your broker app.")
+        why = "; ".join(ctx.get("gift_diag", [])[:3])
+        lines.append("GIFT Nifty: not available (enter it in the app, or see README)."
+                     + (f" Tried: {e(why[:240])}" if why else ""))
     gd = ctx.get("global_df")
     if gd is not None and len(gd):
         lines.append(f"Global cues: <b>{e(str(ctx['global_label']))}</b> (score {ctx['composite']:+.2f})")
@@ -459,3 +611,17 @@ def ctx_track_record(log: pd.DataFrame) -> str:
         hit = (np.sign(s["global_score"].astype(float)) == np.sign(s["nifty_day_ret_pct"].astype(float))).mean() * 100
         parts.append(f"global score direction matched Nifty's day in {hit:.0f}% of {len(s)} sessions")
     return "; ".join(parts) if parts else "building (needs live pre-market runs)"
+
+
+if __name__ == "__main__":
+    import sys
+
+    core.ensure_utf8()
+    if "--dump-zerodha" in sys.argv:
+        print("Rendered text of the Zerodha GIFT Nifty page (send me this if the price is not read):\n")
+        print(selenium_page_text(ZERODHA_URL, _ZERODHA_WAIT)[:4000])
+    else:
+        d: list = []
+        g = fetch_gift_nifty(d)
+        print("GIFT Nifty:", g)
+        print("\n".join(d) if d else "(no problems reported)")
