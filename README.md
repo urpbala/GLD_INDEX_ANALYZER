@@ -11,8 +11,10 @@ Educational research tool. Not financial advice.
 | `index_core.py` | Shared code and the settings you edit (indices, lot sizes, risk rules, bias weights) |
 | `index_research.py` | Tests whether the bias score says anything about what the index does next |
 | `index_context.py` | GIFT Nifty, global markets, news notes and their historical impact on Nifty |
+| `index_plan.py` | Turns the report into a trade-plan checklist (verdict, trigger, stop, targets, risk-fit check) |
 | `index_daily_report.py` | Builds the daily report, keeps the signal log, sends Telegram |
 | `requirements.txt` | Python packages |
+| `packages.txt` | System packages for Streamlit Cloud (Chromium for the Zerodha GIFT reader) |
 | `.github/workflows/daily_report.yml` | After-close report (15:50 IST) and signal log |
 | `.github/workflows/premarket_report.yml` | Morning brief (08:30 IST) with global cues, news and GIFT Nifty |
 | `.streamlit/config.toml` | Dark theme |
@@ -57,14 +59,22 @@ If a token was ever pasted somewhere public, make a new one in BotFather (`/revo
 - **Previous high / low (PH / PL)** for the day, week and month are shown for each index, with the last close compared against the
   range of the period before (closed above the prior high, below the prior low, or inside). The levels also feed the support /
   resistance list. A week or month counts as complete when the next business day falls in a new period (exchange holidays are not known).
-- **GIFT Nifty**: read automatically from the public GIFT Nifty quote pages of **Angel One** and **Upstox** (the freshest of the two is used,
-  with its "as of" time, and a stale warning if it is older than 18 hours). These are ordinary web pages, **not an official data feed**: the layout can change,
-  a site can block cloud servers (GitHub / Streamlit), and their terms may restrict automated use. The job reads them about twice a day. Set `GIFT_WEB=0` to switch this off.
-  If it cannot read a price it says so; then type it yourself:
-  - In the app: *Global* tab -> type the price (and its change %) from your broker app or TradingView (`NSEIX: NIFTY1!`). A typed value always wins.
-  - In the morning job: GitHub -> Actions -> *Pre-market brief* -> *Run workflow* -> fill in the GIFT price from your phone.
-  - Or set `GIFT_YF_TICKER` / `GIFT_NIFTY_PRICE`, or write your own `load_gift_custom()` (e.g. from Angel One SmartAPI, which is the proper route if it carries GIFT Nifty).
-  - Moneycontrol and Investing.com were **not** verified: no page could be opened to check, so they are not used.
+- **GIFT Nifty** is read in this order, stopping at the first fresh reading:
+  1. a price you type (app) or set (`GIFT_NIFTY_PRICE`), 2. your own `load_gift_custom()`,
+  3. the public GIFT Nifty pages of **Angel One** and **Upstox** (plain web requests, the freshest of the two),
+  4. **Zerodha's public GIFT Nifty page** read with a headless browser (Selenium). No Zerodha account or API key is needed.
+     The page's numbers are filled in by JavaScript after it loads, so a plain request cannot see them; the browser step waits for them.
+     It only starts when steps 1-3 gave nothing fresh, because it is slower.
+  - Every reading shows its source and "as of" time, and a stale warning if it is older than 18 hours. A value more than 8% from the Nifty close is rejected.
+  - These are ordinary web pages, **not an official data feed**: layouts change, sites can block cloud servers, and their terms may restrict automated use.
+    The job reads them about twice a day. Switch off parts with `GIFT_WEB=0` (Angel One / Upstox) and `GIFT_ZERODHA=0` (Zerodha browser).
+  - If nothing could be read, the app and the Telegram message say why for each source (for example "HTTP 403" or "Chrome not found").
+    Test it any time: `python index_context.py`. If the Zerodha page opens but no price is read, run `python index_context.py --dump-zerodha`
+    and send me the text it prints, so the reader can be matched to the real page.
+  - **Browser setup:** GitHub Actions already has Chrome (the workflows need nothing more). On Streamlit Cloud, `packages.txt`
+    (chromium, chromium-driver) installs one; if you do not want this, delete `packages.txt` and the `selenium` line in `requirements.txt`.
+  - In the app: *Global* tab -> type the price to override. In the morning job: Actions -> *Pre-market brief* -> *Run workflow* -> GIFT price.
+  - Moneycontrol and Investing.com were **not** verified, so they are not used.
   - GIFT is a futures price, so a small premium to the Nifty close is normal. Its change on its own close is the cleaner signal.
 - **Global markets**: S&P 500, Nasdaq, Nikkei, Hang Seng, KOSPI, Shanghai, FTSE, DAX, dollar index, US 10-year yield, Brent, USD/INR and US VIX.
   Each move is scaled by that market's own recent volatility and combined into one score. The *Global* tab also has a research table that shows
@@ -83,6 +93,14 @@ If a token was ever pasted somewhere public, make a new one in BotFather (`/revo
 - **Verify lot sizes** in `index_core.py` (Nifty 65 is from your old script; Bank Nifty 30 is a placeholder).
 - **The bias score is unvalidated.** Run the Research tab first. If it shows no reliable edge, treat the report as a market summary only.
   After the research supports it, set `BIAS_VALIDATED = True` in `index_core.py`.
+
+## Troubleshooting
+
+- **"compute_tables" / "module not found" / "OLD version" message in the app**: some files in your repo come from different downloads
+  (for example an old `index_research.py`) or one file was not uploaded. Upload ALL files from `index-analyzer.zip`, replacing the existing ones,
+  then in Streamlit Cloud use the app menu -> **Reboot app**. The app now lists exactly which file is old or missing.
+- **GIFT shows 0 / "not available"**: the 0 in the box is only the manual override. Open *GIFT reading details* in the Global tab (or look at the Telegram line) to see why each source failed. Type the price, or start the morning job by hand with the GIFT price.
+- **Global cues unavailable**: Yahoo can rate limit cloud servers. Press Refresh data later.
 
 ## Run on your own computer (optional)
 
